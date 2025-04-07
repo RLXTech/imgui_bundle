@@ -79,3 +79,7 @@
 [submodule "external/implot3d/implot3d"]
 	path = external/implot3d/implot3d
 	url = https://github.com/pthom/implot3d.git
+[submodule "external/hello_imgui/hello_imgui"]
+	path = external/hello_imgui/hello_imgui
+	url = git@github.com:RLXTech/hello_imgui.git
+	branch = master
