@@ -6,10 +6,6 @@
 	path = external/glfw/glfw
 	url = https://github.com/glfw/glfw.git
 	branch = 3.3-stable
-[submodule "external/hello_imgui/hello_imgui"]
-	path = external/hello_imgui/hello_imgui
-	url = https://github.com/RLXTech/hello_imgui.git
-	branch = master
 [submodule "external/ImFileDialog/ImFileDialog"]
 	path = external/ImFileDialog/ImFileDialog
 	url = https://github.com/pthom/ImFileDialog.git
