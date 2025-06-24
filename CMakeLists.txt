@@ -134,9 +134,9 @@ endif()
 # Some included libraries can be disabled individually
 # This works only in C++ (not in python)
 # -----------------------------------------------------------------------------
-option(IMGUI_BUNDLE_DISABLE_NANOVG "Disable nanovg" ON)
+option(IMGUI_BUNDLE_DISABLE_NANOVG "Disable nanovg" OFF)
 option(IMGUI_BUNDLE_DISABLE_IMGUI_TEX_INSPECT "Disable imgui_tex_inspect" ON)
-option(IMGUI_BUNDLE_DISABLE_IMGUIZMO "Disable ImGuizmo" ON)
+option(IMGUI_BUNDLE_DISABLE_IMGUIZMO "Disable ImGuizmo" OFF)
 option(IMGUI_BUNDLE_DISABLE_IMFILEDIALOG "Disable ImFileDialog" ON)
 option(IMGUI_BUNDLE_DISABLE_IMGUI_NODE_EDITOR "Disable imgui-node-editor" ON)
 option(IMGUI_BUNDLE_DISABLE_IMPLOT "Disable implot" OFF)
