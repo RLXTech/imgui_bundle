@@ -8,8 +8,8 @@
 	branch = 3.3-stable
 [submodule "external/hello_imgui/hello_imgui"]
 	path = external/hello_imgui/hello_imgui
-	url = https://github.com/pthom/hello_imgui.git
-	branch = master
+	url = git@github.com:RLXTech/hello_imgui.git
+	branch = latest
 [submodule "external/ImFileDialog/ImFileDialog"]
 	path = external/ImFileDialog/ImFileDialog
 	url = https://github.com/pthom/ImFileDialog.git
