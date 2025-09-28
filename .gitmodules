@@ -82,4 +82,5 @@
 	url = https://github.com/pthom/cvnp_nano.git
 [submodule "external/implot3d/implot3d"]
 	path = external/implot3d/implot3d
-	url = https://github.com/pthom/implot3d.git
+	url = https://github.com/RLXTech/implot3d.git
+	branch = main
