@@ -1,4 +1,5 @@
 #include "immapp.h"
+#include "vd_path/vd_path.h"
 
 #ifdef IMGUI_BUNDLE_WITH_IMPLOT
 #include "implot/implot.h"
@@ -39,6 +40,13 @@ namespace ImmApp
 
     struct ImmAppContext
     {
+#ifdef IMGUI_BUNDLE_WITH_IMPLOT
+        ImPlotContext* ownedImPlot = nullptr;
+#endif
+#ifdef IMGUI_BUNDLE_WITH_IMPLOT3D
+        ImPlot3DContext* ownedImPlot3D = nullptr;
+#endif
+        bool markdownInitialized = false;
 #ifdef IMGUI_BUNDLE_WITH_IMGUI_NODE_EDITOR
         std::optional<ax::NodeEditor::EditorContext *> _NodeEditorContext;
         ax::NodeEditor::Config _NodeEditorConfig;
@@ -59,11 +67,9 @@ namespace ImmApp
     static void Priv_TearDown();
 
 
-    static void Priv_Setup(HelloImGui::RunnerParams& runnerParams, const AddOnsParams& passedAddOnsParams)
+    // Establish add-on ownership and install cleanup for both Hello exits; caller guards partial failure.
+    static void Priv_Setup(HelloImGui::RunnerParams& runnerParams, const AddOnsParams& passedAddOnsParams, bool& acquired)
     {
-        gAddOnsParamsAtSetup = passedAddOnsParams;
-        AddOnsParams& addOnsParams = gAddOnsParamsAtSetup; // We may modify those
-
         // Check if we are already running
 #ifdef IMGUI_BUNDLE_BUILD_PYTHON
         // For python, we forgive the user for not calling TearDown() before calling Renderer()
@@ -78,18 +84,33 @@ namespace ImmApp
         if (gRendererInstanceCount > 0)
         throw std::runtime_error("Only one instance of `ImmApp::Renderer` can exist at a time.");
 #endif
+        gAddOnsParamsAtSetup = passedAddOnsParams;
+        AddOnsParams& addOnsParams = gAddOnsParamsAtSetup;
         gRendererInstanceCount++;
+        acquired = true; // Only this setup attempt may release the newly established session.
 
+        // App cleanup precedes add-on cleanup, and both precede Hello's context teardown.
+        // A throwing app callback must not prevent owned add-ons from being released.
+        auto withOwnedCleanup = [](HelloImGui::VoidFunction callback) {
+            return [callback]() {
+                std::exception_ptr failure;
+                try { if (callback) callback(); } catch (...) { failure = std::current_exception(); }
+                try { Priv_TearDown(); } catch (...) { if (!failure) failure = std::current_exception(); }
+                if (failure) std::rethrow_exception(failure);
+            };
+        };
+        runnerParams.callbacks.BeforeExit = withOwnedCleanup(runnerParams.callbacks.BeforeExit);
+        runnerParams.callbacks.BeforeExit_OnException = withOwnedCleanup(runnerParams.callbacks.BeforeExit_OnException);
 
         // create implot context if required
 #ifdef IMGUI_BUNDLE_WITH_IMPLOT
         if (addOnsParams.withImplot)
-            ImPlot::CreateContext();
+            gImmAppContext.ownedImPlot = ImPlot::CreateContext();
 #endif
         // create implot3d context if required
 #ifdef IMGUI_BUNDLE_WITH_IMPLOT3D
         if (addOnsParams.withImplot3d)
-            ImPlot3D::CreateContext();
+            gImmAppContext.ownedImPlot3D = ImPlot3D::CreateContext();
 #endif
 
 #ifdef IMGUI_BUNDLE_WITH_IMGUI_NODE_EDITOR
@@ -140,6 +161,7 @@ namespace ImmApp
             if (!addOnsParams.withMarkdownOptions.has_value())
                 addOnsParams.withMarkdownOptions = ImGuiMd::MarkdownOptions();
             ImGuiMd::InitializeMarkdown(addOnsParams.withMarkdownOptions.value());
+            gImmAppContext.markdownInitialized = true;
 
             runnerParams.callbacks.LoadAdditionalFonts = HelloImGui::SequenceFunctions(
                 runnerParams.callbacks.LoadAdditionalFonts,
@@ -177,16 +199,21 @@ namespace ImmApp
             // Modify before-exit: DeInit ImGuiTexInspect
             {
                 auto fn_ImGuiTextInspect_DeInit = [&addOnsParams](){
-                    if (addOnsParams.withTexInspect)
+                    if (gImmAppContext._ImGuiTextInspect_Context)
                     {
                         ImGuiTexInspect::Shutdown();
                         ImGuiTexInspect::DestroyContext(gImmAppContext._ImGuiTextInspect_Context);
+                        gImmAppContext._ImGuiTextInspect_Context = nullptr;
                         ImGuiTexInspect::ImplOpenGl3_Shutdown();
                     }
                 };
                 runnerParams.callbacks.BeforeExit = HelloImGui::SequenceFunctions(
                     fn_ImGuiTextInspect_DeInit,
                     runnerParams.callbacks.BeforeExit
+                );
+                runnerParams.callbacks.BeforeExit_OnException = HelloImGui::SequenceFunctions(
+                    fn_ImGuiTextInspect_DeInit,
+                    runnerParams.callbacks.BeforeExit_OnException
                 );
             }
         }
@@ -197,42 +224,70 @@ namespace ImmApp
         runnerParams.callbacks.BeforeExit = HelloImGui::SequenceFunctions(
             runnerParams.callbacks.BeforeExit,
             ImmVision::ClearTextureCache);
+        runnerParams.callbacks.BeforeExit_OnException = HelloImGui::SequenceFunctions(
+            runnerParams.callbacks.BeforeExit_OnException,
+            ImmVision::ClearTextureCache);
 #endif
     }
 
+    // Idempotently release actual owned initialization stages, never another caller's context.
     static void Priv_TearDown()
     {
-        AddOnsParams& addOnsParams = gAddOnsParamsAtSetup;
-
+        if (gRendererInstanceCount == 0) return;
         gRendererInstanceCount = 0;
-
+        std::exception_ptr failure;
+        auto attempt = [&](auto&& action) {
+            try { action(); } catch (...) { if (!failure) failure = std::current_exception(); }
+        };
 #ifdef IMGUI_BUNDLE_WITH_IMPLOT
-        if (addOnsParams.withImplot)
-            ImPlot::DestroyContext();
-#endif
-#ifdef IMGUI_BUNDLE_WITH_IMPLOT3D
-        if (addOnsParams.withImplot3d)
-            ImPlot3D::DestroyContext();
-#endif
-
-#ifdef IMGUI_BUNDLE_WITH_IMGUI_NODE_EDITOR
-        if (addOnsParams.withNodeEditor)
+        if (gImmAppContext.ownedImPlot)
         {
-            assert(gImmAppContext._NodeEditorContext.has_value());
-            ax::NodeEditor::DestroyEditor(*gImmAppContext._NodeEditorContext);
-            gImmAppContext._NodeEditorContext = std::nullopt;
+            auto owned = gImmAppContext.ownedImPlot;
+            gImmAppContext.ownedImPlot = nullptr;
+            attempt([&] { ImPlot::DestroyContext(owned); });
         }
 #endif
-
-        if (addOnsParams.withMarkdown || addOnsParams.withMarkdownOptions.has_value())
-            ImGuiMd::DeInitializeMarkdown();
+#ifdef IMGUI_BUNDLE_WITH_IMPLOT3D
+        if (gImmAppContext.ownedImPlot3D)
+        {
+            auto owned = gImmAppContext.ownedImPlot3D;
+            gImmAppContext.ownedImPlot3D = nullptr;
+            attempt([&] { ImPlot3D::DestroyContext(owned); });
+        }
+#endif
+#ifdef IMGUI_BUNDLE_WITH_IMGUI_NODE_EDITOR
+        if (gImmAppContext._NodeEditorContext.has_value())
+        {
+            auto owned = *gImmAppContext._NodeEditorContext;
+            gImmAppContext._NodeEditorContext.reset();
+            attempt([&] { ax::NodeEditor::DestroyEditor(owned); });
+        }
+#endif
+        if (gImmAppContext.markdownInitialized)
+        {
+            gImmAppContext.markdownInitialized = false;
+            attempt([&] { ImGuiMd::DeInitializeMarkdown(); });
+        }
+        if (failure) std::rethrow_exception(failure);
     }
 
+    // Run one owned session; all recoverable setup/frame failures release add-ons and preserve the original error.
     void Run(HelloImGui::RunnerParams& runnerParams, const AddOnsParams& addOnsParams)
     {
-        Priv_Setup(runnerParams, addOnsParams);
-        HelloImGui::Run(runnerParams);
-        Priv_TearDown();
+        bool acquired = false;
+        try
+        {
+            Priv_Setup(runnerParams, addOnsParams, acquired);
+            HelloImGui::Run(runnerParams);
+            Priv_TearDown();
+        }
+        catch (...)
+        {
+            // Preserve the original setup/frame failure even if final cleanup also fails.
+            if (acquired)
+                try { Priv_TearDown(); } catch (...) { fprintf(stderr, "ImmApp: failure during exception cleanup\n"); }
+            throw;
+        }
     }
 
     void Run(const HelloImGui::SimpleRunnerParams& simpleParams, const AddOnsParams& addOnsParams)
@@ -388,18 +443,20 @@ namespace ImmApp
         std::string filename = NodeEditorSettingsLocation(runnerParams);
         if (filename.empty())
             return false;
-        return std::filesystem::exists(filename);
+        const auto admitted = vdas::path::require(vdas::path::parseUtf8(filename, "immapp.node-settings"));
+        return vdas::path::require(vdas::path::exists(admitted));
     }
 
     // DeleteNodeEditorSettings deletes the json file for the node editor settings.
     void DeleteNodeEditorSettings(const HelloImGui::RunnerParams& runnerParams)
     {
-        std::string filename = IniSettingsLocation(runnerParams);
+        std::string filename = NodeEditorSettingsLocation(runnerParams);
         if (filename.empty())
             return;
-        if (!std::filesystem::exists(filename))
+        const auto admitted = vdas::path::require(vdas::path::parseUtf8(filename, "immapp.node-settings"));
+        if (!vdas::path::require(vdas::path::exists(admitted)))
             return;
-        bool success = std::filesystem::remove(filename);
+        bool success = vdas::path::require(vdas::path::remove(admitted));
         IM_ASSERT(success && "Failed to delete ini file %s");
     }
 
@@ -423,7 +480,7 @@ namespace ManualRender  // namespace ImmApp::ManualRender
     void TrySwitchToInitialized()
     {
         if (sCurrentStatus == RendererStatus::Initialized)
-            IM_ASSERT(false && "ImmApp::ManualRender::SetupFromXXX() cannot be called while already initialized. Call TearDown() first.");
+            throw std::runtime_error("ImmApp::ManualRender is already initialized. Call TearDown() first.");
         sCurrentStatus = RendererStatus::Initialized;
     }
 
@@ -439,10 +496,22 @@ namespace ManualRender  // namespace ImmApp::ManualRender
 
     void SetupFromRunnerParams(const HelloImGui::RunnerParams& runnerParams, const AddOnsParams& addOnsParams)
     {
+        const auto previousStatus = sCurrentStatus;
         TrySwitchToInitialized();
         HelloImGui::RunnerParams runnerParamsCopy = runnerParams;
-        Priv_Setup(runnerParamsCopy, addOnsParams);
-        HelloImGui::ManualRender::SetupFromRunnerParams(runnerParamsCopy);
+        bool acquired = false;
+        try
+        {
+            Priv_Setup(runnerParamsCopy, addOnsParams, acquired);
+            HelloImGui::ManualRender::SetupFromRunnerParams(runnerParamsCopy);
+        }
+        catch (...)
+        {
+            if (acquired)
+                try { Priv_TearDown(); } catch (...) { fprintf(stderr, "ImmApp: failure during manual setup cleanup\n"); }
+            sCurrentStatus = previousStatus;
+            throw;
+        }
     }
 
     void SetupFromSimpleRunnerParams(const HelloImGui::SimpleRunnerParams& simpleParams, const AddOnsParams& addOnsParams)

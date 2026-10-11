@@ -12,6 +12,9 @@
 
 #pragma once
 
+#include "vd_path/vd_native_text.h"
+#include "vd_path/vd_system_path.h"
+
 #if _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #   define WIN32_LEAN_AND_MEAN 1
@@ -434,21 +437,12 @@ namespace pfd
     {
 
 #if _WIN32
+        // Fixed UTF-8/native dialog boundary; strict failures propagate through the future.
         static inline std::wstring str2wstr(std::string const& str)
-        {
-            int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0);
-            std::wstring ret(len, '\0');
-            MultiByteToWideChar(CP_UTF8, 0, str.c_str(), (int)str.size(), (LPWSTR)ret.data(), (int)ret.size());
-            return ret;
-        }
+        { return vdas::path::require(vdas::path::nativeText(str, "pfd.input")); }
 
         static inline std::string wstr2str(std::wstring const& str)
-        {
-            int len = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), (int)str.size(), nullptr, 0, nullptr, nullptr);
-            std::string ret(len, '\0');
-            WideCharToMultiByte(CP_UTF8, 0, str.c_str(), (int)str.size(), (LPSTR)ret.data(), (int)ret.size(), nullptr, nullptr);
-            return ret;
-        }
+        { return vdas::path::require(vdas::path::fromNative(std::filesystem::path(str), "pfd.native-result")).utf8(); }
 
         static inline bool is_vista()
         {
@@ -485,18 +479,15 @@ namespace pfd
 
         // This is necessary until C++17 which will have std::filesystem::is_directory
 
-        static inline bool is_directory(std::string const& path)
+        // Fixed filename metadata adapter; never probes an ANSI/replacement spelling.
+        static inline bool is_directory(std::string const& text)
         {
-#if _WIN32
-            auto attr = GetFileAttributesA(path.c_str());
-            return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
-#elif __EMSCRIPTEN__
-            // TODO
-            return false;
-#else
-            struct stat s;
-            return stat(path.c_str(), &s) == 0 && S_ISDIR(s.st_mode);
-#endif
+            auto admitted = vdas::path::parseUtf8(text, "pfd.directory-probe");
+            if (!admitted) throw vdas::path::PathFailure(admitted.error());
+            auto result = vdas::path::isDirectory(admitted.value());
+            if (!result && result.error().code != vdas::path::PathErrorCode::NotFound)
+                throw vdas::path::PathFailure(result.error());
+            return result && result.value();
         }
 
         // This is necessary because getenv is not thread-safe
@@ -636,46 +627,14 @@ namespace pfd
     }
 
     // path implementation
+    // Keep the dialog's USERPROFILE preference; native missing-home fallback is shared.
     inline std::string path::home()
     {
 #if _WIN32
-        // First try the USERPROFILE environment variable
-        auto user_profile = internal::getenv("USERPROFILE");
-        if (user_profile.size() > 0)
-            return user_profile;
-        // Otherwise, try GetUserProfileDirectory()
-        HANDLE token = nullptr;
-        DWORD len = MAX_PATH;
-        char buf[MAX_PATH] = { '\0' };
-        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-        {
-            dll userenv("userenv.dll");
-            dll::proc<BOOL WINAPI(HANDLE, LPSTR, LPDWORD)> get_user_profile_directory(userenv, "GetUserProfileDirectoryA");
-            get_user_profile_directory(token, buf, &len);
-            CloseHandle(token);
-            if (*buf)
-                return buf;
-        }
-#elif __EMSCRIPTEN__
-        return "/";
-#else
-        // First try the HOME environment variable
-        auto home = internal::getenv("HOME");
-        if (home.size() > 0)
-            return home;
-        // Otherwise, try getpwuid_r()
-        size_t len = 4096;
-#if defined(_SC_GETPW_R_SIZE_MAX)
-        auto size_max = sysconf(_SC_GETPW_R_SIZE_MAX);
-        if (size_max != -1)
-            len = size_t(size_max);
+        const auto profile = vdas::path::require(vdas::path::optionalEnvironmentPath("USERPROFILE"));
+        if (profile) return profile->utf8();
 #endif
-        std::vector<char> buf(len);
-        struct passwd pwd, * result;
-        if (getpwuid_r(getuid(), &pwd, buf.data(), buf.size(), &result) == 0)
-            return result->pw_dir;
-#endif
-        return "/";
+        return vdas::path::require(vdas::path::userDirectory(vdas::path::UserDirectory::Home)).utf8();
     }
 
     inline std::string path::separator()
