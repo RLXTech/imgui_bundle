@@ -203,6 +203,7 @@ namespace pfd
             std::condition_variable m_cond;
             std::mutex m_mutex;
             DWORD m_tid;
+            bool m_started = false; // Protected by m_mutex; avoids lost wakeups on immediate failures.
 #elif __EMSCRIPTEN__ || __NX__
             // FIXME: do something
 #else
@@ -436,13 +437,92 @@ namespace pfd
     namespace internal
     {
 
-#if _WIN32
-        // Fixed UTF-8/native dialog boundary; strict failures propagate through the future.
-        static inline std::wstring str2wstr(std::string const& str)
-        { return vdas::path::require(vdas::path::nativeText(str, "pfd.input")); }
+        /**
+         * @brief Convert each UTF-8 filter field before adding native NUL list delimiters.
+         * @param filters Alternating nonempty descriptions and space-separated patterns.
+         * @return Double-NUL-terminated native buffer; malformed fields/pairs throw before any UI call.
+         * This pure adapter also runs in host probes; Windows nativeText supplies UTF-16.
+         */
+        static inline std::filesystem::path::string_type native_filter_list(std::vector<std::string> const& filters)
+        {
+            if (filters.size() % 2 != 0)
+            {
+                throw std::invalid_argument("pfd.filters: description/pattern pairs required");
+            }
+            std::filesystem::path::string_type result;
+            const std::regex                   whitespace("  *");
+            for (size_t index = 0; index < filters.size(); index += 2)
+            {
+                if (filters[index].empty() || filters[index + 1].empty())
+                {
+                    throw std::invalid_argument("pfd.filters: empty description or pattern");
+                }
+                result += vdas::path::require(vdas::path::nativeText(filters[index], "pfd.filter-description"));
+                result.push_back(0);
+                const auto pattern = std::regex_replace(filters[index + 1], whitespace, ";");
+                result += vdas::path::require(vdas::path::nativeText(pattern, "pfd.filter-pattern"));
+                result.push_back(0);
+            }
+            result.push_back(0);
+            if (filters.empty())
+            {
+                result.push_back(0);
+            }
+            return result;
+        }
 
+#if _WIN32
+        /** @brief Convert one declared UTF-8 value; source identifies its field. NUL remains invalid. */
+        static inline std::wstring str2wstr(std::string const& str, const char* source = "pfd.text")
+        {
+            return vdas::path::require(vdas::path::nativeText(str, source));
+        }
+
+        /** @brief Admit one native result losslessly; invalid UTF-16 is a failure, never a cancel. */
         static inline std::string wstr2str(std::wstring const& str)
-        { return vdas::path::require(vdas::path::fromNative(std::filesystem::path(str), "pfd.native-result")).utf8(); }
+        {
+            return vdas::path::require(vdas::path::fromNative(std::filesystem::path(str), "pfd.native-result")).utf8();
+        }
+
+        /** @brief Throw a stage-specific error through the existing future/application error boundary. */
+        [[noreturn]] static inline void dialog_failure(const char* operation, unsigned long error)
+        {
+            throw vdas::path::PathFailure({vdas::path::PathErrorCode::IoError,
+                                           operation,
+                                           "pfd.native",
+                                           std::error_code(static_cast<int>(error), std::system_category())});
+        }
+
+        /** @brief Require COM success; callers handle the one documented cancellation result first. */
+        static inline void require_hresult(HRESULT result, const char* operation)
+        {
+            if (FAILED(result))
+            {
+                dialog_failure(operation, static_cast<unsigned long>(result));
+            }
+        }
+
+        /** @brief Own one COM reference from acquisition until every success/exception exit. */
+        template <typename T>
+        struct com_release
+        {
+            void operator()(T* object) const
+            {
+                if (object)
+                {
+                    object->Release();
+                }
+            }
+        };
+
+        /** @brief Own shell-allocated output before any strict conversion can throw. */
+        struct shell_free
+        {
+            void operator()(void* memory) const
+            {
+                CoTaskMemFree(memory);
+            }
+        };
 
         static inline bool is_vista()
         {
@@ -696,6 +776,7 @@ namespace pfd
 #endif
 
 #if _WIN32
+    /** @brief Start one worker with a same-mutex readiness predicate; results/exceptions remain in its future. */
     inline void internal::executor::start_func(std::function<std::string(int*)> const& fun)
     {
         stop();
@@ -703,15 +784,24 @@ namespace pfd
         auto trampoline = [fun, this]()
         {
             // Save our thread id so that the caller can cancel us
-            m_tid = GetCurrentThreadId();
-            EnumWindows(&enum_windows_callback, (LPARAM)this);
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_tid = GetCurrentThreadId();
+                EnumWindows(&enum_windows_callback, (LPARAM)this);
+                m_started = true;
+            }
             m_cond.notify_all();
             return fun(&m_exit_code);
         };
 
         std::unique_lock<std::mutex> lock(m_mutex);
-        m_future = std::async(std::launch::async, trampoline);
-        m_cond.wait(lock);
+        m_started = false;
+        m_future  = std::async(std::launch::async, trampoline);
+        m_cond.wait(lock,
+                    [this]()
+                    {
+                        return m_started;
+                    });
         m_running = true;
     }
 
@@ -854,13 +944,18 @@ namespace pfd
     // ole32_dll implementation
 
 #if _WIN32
-    inline internal::platform::ole32_dll::ole32_dll()
-        : dll("ole32.dll")
+    /** @brief Initialize COM on the calling worker; native failure propagates before any dialog acquisition. */
+    inline internal::platform::ole32_dll::ole32_dll() : dll("ole32.dll")
     {
         // Use COINIT_MULTITHREADED because COINIT_APARTMENTTHREADED causes crashes.
         // See https://github.com/samhocevar/portable-file-dialogs/issues/51
         auto coinit = proc<HRESULT WINAPI(LPVOID, DWORD)>(*this, "CoInitializeEx");
+        if (!coinit)
+        {
+            internal::dialog_failure("CoInitializeEx.unavailable", ERROR_PROC_NOT_FOUND);
+        }
         m_state = coinit(nullptr, COINIT_MULTITHREADED);
+        internal::require_hresult(m_state, "CoInitializeEx");
     }
 
     inline internal::platform::ole32_dll::~ole32_dll()
@@ -878,20 +973,31 @@ namespace pfd
     // new_style_context implementation
 
 #if _WIN32
+    /** @brief Activate the process-owned native context for this thread, or report the original native error. */
     inline internal::platform::new_style_context::new_style_context()
     {
-        // Only create one activation context for the whole app lifetime.
-        static HANDLE hctx = create();
-
-        if (hctx != INVALID_HANDLE_VALUE)
-            ActivateActCtx(hctx, &m_cookie);
+        // Retain one owned context for the process, with a separate activation per thread/use.
+        static const std::shared_ptr<void> context(create(),
+                                                   [](HANDLE handle)
+                                                   {
+                                                       ReleaseActCtx(handle);
+                                                   });
+        if (!ActivateActCtx(context.get(), &m_cookie))
+        {
+            internal::dialog_failure("ActivateActCtx", GetLastError());
+        }
     }
 
+    /** @brief End this thread activation; the shared process context retains independent ownership. */
     inline internal::platform::new_style_context::~new_style_context()
     {
-        DeactivateActCtx(0, m_cookie);
+        if (m_cookie != 0)
+        {
+            DeactivateActCtx(0, m_cookie);
+        }
     }
 
+    /** @brief Create one context from the common native system directory; return an owned handle or throw. */
     inline HANDLE internal::platform::new_style_context::create()
     {
         // This “hack” seems to be necessary for this code to work on windows XP.
@@ -904,20 +1010,29 @@ namespace pfd
         dll comdlg32("comdlg32.dll");
 
         // Using approach as shown here: https://stackoverflow.com/a/10444161
-        UINT len = ::GetSystemDirectoryA(nullptr, 0);
-        std::string sys_dir(len, '\0');
-        ::GetSystemDirectoryA(&sys_dir[0], len);
+        const auto  system_directory = vdas::path::require(vdas::path::systemDirectory());
+        const auto& native_directory = vdas::path::detail::NativeAccess::get(system_directory);
 
-        ACTCTXA act_ctx =
-        {
+        ACTCTXW act_ctx = {
             // Do not set flag ACTCTX_FLAG_SET_PROCESS_DEFAULT, since it causes a
             // crash with error “default context is already set”.
             sizeof(act_ctx),
             ACTCTX_FLAG_RESOURCE_NAME_VALID | ACTCTX_FLAG_ASSEMBLY_DIRECTORY_VALID,
-            "shell32.dll", 0, 0, sys_dir.c_str(), (LPCSTR)124, nullptr, 0,
+            L"shell32.dll",
+            0,
+            0,
+            native_directory.c_str(),
+            MAKEINTRESOURCEW(124),
+            nullptr,
+            0,
         };
 
-        return ::CreateActCtxA(&act_ctx);
+        const auto context = ::CreateActCtxW(&act_ctx);
+        if (context == INVALID_HANDLE_VALUE)
+        {
+            internal::dialog_failure("CreateActCtxW", GetLastError());
+        }
+        return context;
     }
 #endif // _WIN32
 
@@ -1016,6 +1131,11 @@ namespace pfd
 
     // file_dialog implementation
 
+    /**
+     * @brief Launch one native dialog: title/default path are single UTF-8 fields; filters are paired fields.
+     * Folder mode ignores filters. Native cancellation returns empty; all other failures cross the future.
+     * Result buffers and COM/PIDL objects are owned before admission can throw; no ACP fallback is used.
+     */
     inline internal::file_dialog::file_dialog(type in_type,
         std::string const& title,
         std::string const& default_path /* = "" */,
@@ -1023,147 +1143,175 @@ namespace pfd
         opt options /* = opt::none */)
     {
 #if _WIN32
-        std::string filter_list;
-        std::regex whitespace("  *");
-        for (size_t i = 0; i + 1 < filters.size(); i += 2)
-        {
-            filter_list += filters[i] + '\0';
-            filter_list += std::regex_replace(filters[i + 1], whitespace, ";") + '\0';
-        }
-        filter_list += '\0';
-
-        m_async->start_func([this, in_type, title, default_path, filter_list,
-            options](int* exit_code) -> std::string
+        m_async->start_func(
+            [this, in_type, title, default_path, filters, options](int* exit_code) -> std::string
             {
                 (void)exit_code;
-        m_wtitle = internal::str2wstr(title);
-        m_wdefault_path = internal::str2wstr(default_path);
-        auto wfilter_list = internal::str2wstr(filter_list);
+                m_wtitle        = internal::str2wstr(title, "pfd.title");
+                m_wdefault_path = internal::str2wstr(default_path, "pfd.default-path");
 
-        // Initialise COM. This is required for the new folder selection window,
-        // (see https://github.com/samhocevar/portable-file-dialogs/pull/21)
-        // and to avoid random crashes with GetOpenFileNameW() (see
-        // https://github.com/samhocevar/portable-file-dialogs/issues/51)
-        ole32_dll ole32;
+                // Initialise COM. This is required for the new folder selection window,
+                // (see https://github.com/samhocevar/portable-file-dialogs/pull/21)
+                // and to avoid random crashes with GetOpenFileNameW() (see
+                // https://github.com/samhocevar/portable-file-dialogs/issues/51)
+                ole32_dll ole32;
 
-        // Folder selection uses a different method
-        if (in_type == type::folder)
-        {
+                // Folder selection uses a different method
+                if (in_type == type::folder)
+                {
 #if PFD_HAS_IFILEDIALOG
-            if (flags(flag::is_vista))
-            {
-                // On Vista and higher we should be able to use IFileDialog for folder selection
-                IFileDialog* ifd;
-                HRESULT hr = dll::proc<HRESULT WINAPI(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*)>(ole32, "CoCreateInstance")
-                    (CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ifd));
+                    if (flags(flag::is_vista))
+                    {
+                        // On Vista and higher we should be able to use IFileDialog for folder selection
+                        IFileDialog* ifd = nullptr;
+                        HRESULT      hr  = dll::proc<HRESULT WINAPI(REFCLSID, LPUNKNOWN, DWORD, REFIID, LPVOID*)>(
+                            ole32, "CoCreateInstance")(
+                            CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ifd));
 
-                // In case CoCreateInstance fails (which it should not), try legacy approach
-                if (SUCCEEDED(hr))
-                    return select_folder_vista(ifd, options & opt::force_path);
-            }
+                        // In case CoCreateInstance fails (which it should not), try legacy approach
+                        if (SUCCEEDED(hr))
+                        {
+                            return select_folder_vista(ifd, options & opt::force_path);
+                        }
+                    }
 #endif
 
-            BROWSEINFOW bi;
-            memset(&bi, 0, sizeof(bi));
+                    BROWSEINFOW bi;
+                    memset(&bi, 0, sizeof(bi));
 
-            bi.lpfn = &bffcallback;
-            bi.lParam = (LPARAM)this;
+                    bi.lpfn    = &bffcallback;
+                    bi.lParam  = (LPARAM)this;
+                    bi.ulFlags = BIF_RETURNONLYFSDIRS;
 
-            if (flags(flag::is_vista))
-            {
-                if (ole32.is_initialized())
-                    bi.ulFlags |= BIF_NEWDIALOGSTYLE;
-                bi.ulFlags |= BIF_EDITBOX;
-                bi.ulFlags |= BIF_STATUSTEXT;
-            }
+                    if (flags(flag::is_vista))
+                    {
+                        if (ole32.is_initialized())
+                        {
+                            bi.ulFlags |= BIF_NEWDIALOGSTYLE;
+                        }
+                        bi.ulFlags |= BIF_EDITBOX;
+                        bi.ulFlags |= BIF_STATUSTEXT;
+                    }
 
-            auto* list = SHBrowseForFolderW(&bi);
-            std::string ret;
-            if (list)
-            {
-                auto buffer = new wchar_t[MAX_PATH];
-                SHGetPathFromIDListW(list, buffer);
-                dll::proc<void WINAPI(LPVOID)>(ole32, "CoTaskMemFree")(list);
-                ret = internal::wstr2str(buffer);
-                delete[] buffer;
-            }
-            return ret;
-        }
+                    const std::unique_ptr<ITEMIDLIST, internal::shell_free> list(SHBrowseForFolderW(&bi));
+                    if (list)
+                    {
+                        std::vector<wchar_t> buffer(MAX_PATH, L'\0');
+                        if (!SHGetPathFromIDListW(list.get(), buffer.data()))
+                        {
+                            // This API does not define GetLastError; report the failed operation explicitly.
+                            internal::dialog_failure("SHGetPathFromIDListW", ERROR_INVALID_DATA);
+                        }
+                        return internal::wstr2str(buffer.data());
+                    }
+                    return "";
+                }
 
-        OPENFILENAMEW ofn;
-        memset(&ofn, 0, sizeof(ofn));
-        ofn.lStructSize = sizeof(OPENFILENAMEW);
-        ofn.hwndOwner = GetActiveWindow();
+                const auto    wfilter_list = internal::native_filter_list(filters);
+                OPENFILENAMEW ofn;
+                memset(&ofn, 0, sizeof(ofn));
+                ofn.lStructSize = sizeof(OPENFILENAMEW);
+                ofn.hwndOwner   = GetActiveWindow();
 
-        ofn.lpstrFilter = wfilter_list.c_str();
+                ofn.lpstrFilter = wfilter_list.c_str();
 
-        auto woutput = std::wstring(MAX_PATH * 256, L'\0');
-        ofn.lpstrFile = (LPWSTR)woutput.data();
-        ofn.nMaxFile = (DWORD)woutput.size();
-        if (!m_wdefault_path.empty())
-        {
-            // If a directory was provided, use it as the initial directory. If
-            // a valid path was provided, use it as the initial file. Otherwise,
-            // let the Windows API decide.
-            auto path_attr = GetFileAttributesW(m_wdefault_path.c_str());
-            if (path_attr != INVALID_FILE_ATTRIBUTES && (path_attr & FILE_ATTRIBUTE_DIRECTORY))
-                ofn.lpstrInitialDir = m_wdefault_path.c_str();
-            else if (m_wdefault_path.size() <= woutput.size())
-                //second argument is size of buffer, not length of string
-                StringCchCopyW(ofn.lpstrFile, MAX_PATH * 256 + 1, m_wdefault_path.c_str());
-            else
-            {
-                ofn.lpstrFileTitle = (LPWSTR)m_wdefault_path.data();
-                ofn.nMaxFileTitle = (DWORD)m_wdefault_path.size();
-            }
-        }
-        ofn.lpstrTitle = m_wtitle.c_str();
-        ofn.Flags = OFN_NOCHANGEDIR | OFN_EXPLORER;
+                auto woutput  = std::wstring(MAX_PATH * 256, L'\0');
+                ofn.lpstrFile = (LPWSTR)woutput.data();
+                ofn.nMaxFile  = (DWORD)woutput.size();
+                if (!m_wdefault_path.empty())
+                {
+                    // If a directory was provided, use it as the initial directory. If
+                    // a valid path was provided, use it as the initial file. Otherwise,
+                    // let the Windows API decide.
+                    auto path_attr = GetFileAttributesW(m_wdefault_path.c_str());
+                    if (path_attr != INVALID_FILE_ATTRIBUTES && (path_attr & FILE_ATTRIBUTE_DIRECTORY))
+                    {
+                        ofn.lpstrInitialDir = m_wdefault_path.c_str();
+                    }
+                    else if (m_wdefault_path.size() < woutput.size())
+                    {
+                        internal::require_hresult(
+                            StringCchCopyW(ofn.lpstrFile, woutput.size(), m_wdefault_path.c_str()),
+                            "StringCchCopyW.default-path");
+                    }
+                    else
+                    {
+                        internal::dialog_failure("pfd.default-path.length", ERROR_FILENAME_EXCED_RANGE);
+                    }
+                }
+                ofn.lpstrTitle = m_wtitle.c_str();
+                ofn.Flags      = OFN_NOCHANGEDIR | OFN_EXPLORER;
 
-        dll comdlg32("comdlg32.dll");
+                dll comdlg32("comdlg32.dll");
 
-        // Apply new visual style (required for windows XP)
-        new_style_context ctx;
+                // Apply new visual style (required for windows XP)
+                new_style_context ctx;
 
-        if (in_type == type::save)
-        {
-            if (!(options & opt::force_overwrite))
-                ofn.Flags |= OFN_OVERWRITEPROMPT;
+                if (in_type == type::save)
+                {
+                    if (!(options & opt::force_overwrite))
+                    {
+                        ofn.Flags |= OFN_OVERWRITEPROMPT;
+                    }
 
-            dll::proc<BOOL WINAPI(LPOPENFILENAMEW)> get_save_file_name(comdlg32, "GetSaveFileNameW");
-            if (get_save_file_name(&ofn) == 0)
+                    dll::proc<BOOL WINAPI(LPOPENFILENAMEW)> get_save_file_name(comdlg32, "GetSaveFileNameW");
+                    if (!get_save_file_name)
+                    {
+                        internal::dialog_failure("GetSaveFileNameW.unavailable", ERROR_PROC_NOT_FOUND);
+                    }
+                    if (get_save_file_name(&ofn) == 0)
+                    {
+                        const DWORD error = CommDlgExtendedError();
+                        if (error != 0)
+                        {
+                            internal::dialog_failure("GetSaveFileNameW", error);
+                        }
+                        return "";
+                    }
+                    return internal::wstr2str(woutput.c_str());
+                }
+                else
+                {
+                    if (options & opt::multiselect)
+                    {
+                        ofn.Flags |= OFN_ALLOWMULTISELECT;
+                    }
+                    ofn.Flags |= OFN_PATHMUSTEXIST;
+
+                    dll::proc<BOOL WINAPI(LPOPENFILENAMEW)> get_open_file_name(comdlg32, "GetOpenFileNameW");
+                    if (!get_open_file_name)
+                    {
+                        internal::dialog_failure("GetOpenFileNameW.unavailable", ERROR_PROC_NOT_FOUND);
+                    }
+                    if (get_open_file_name(&ofn) == 0)
+                    {
+                        const DWORD error = CommDlgExtendedError();
+                        if (error != 0)
+                        {
+                            internal::dialog_failure("GetOpenFileNameW", error);
+                        }
+                        return "";
+                    }
+                }
+
+                std::string prefix;
+                for (wchar_t const* p = woutput.c_str(); *p;)
+                {
+                    auto filename = internal::wstr2str(p);
+                    p += wcslen(p);
+                    // In multiselect mode, we advance p one wchar further and
+                    // check for another filename. If there is one and the
+                    // prefix is empty, it means we just read the prefix.
+                    if ((options & opt::multiselect) && *++p && prefix.empty())
+                    {
+                        prefix = filename + "/";
+                        continue;
+                    }
+
+                    m_vector_result.push_back(prefix + filename);
+                }
+
                 return "";
-            return internal::wstr2str(woutput.c_str());
-        }
-        else
-        {
-            if (options & opt::multiselect)
-                ofn.Flags |= OFN_ALLOWMULTISELECT;
-            ofn.Flags |= OFN_PATHMUSTEXIST;
-
-            dll::proc<BOOL WINAPI(LPOPENFILENAMEW)> get_open_file_name(comdlg32, "GetOpenFileNameW");
-            if (get_open_file_name(&ofn) == 0)
-                return "";
-        }
-
-        std::string prefix;
-        for (wchar_t const* p = woutput.c_str(); *p; )
-        {
-            auto filename = internal::wstr2str(p);
-            p += wcslen(p);
-            // In multiselect mode, we advance p one wchar further and
-            // check for another filename. If there is one and the
-            // prefix is empty, it means we just read the prefix.
-            if ((options & opt::multiselect) && *++p && prefix.empty())
-            {
-                prefix = filename + "/";
-                continue;
-            }
-
-            m_vector_result.push_back(prefix + filename);
-        }
-
-        return "";
             });
 #elif __EMSCRIPTEN__
         // FIXME: do something
@@ -1368,78 +1516,72 @@ namespace pfd
     }
 
 #if PFD_HAS_IFILEDIALOG
+    /**
+     * @brief Consume one owned COM dialog and return an admitted path, or empty only for user cancellation.
+     * Default-folder hints are applied before Show. All acquired resources are owned before calls that can fail.
+     */
     inline std::string internal::file_dialog::select_folder_vista(IFileDialog* ifd, bool force_path)
     {
-        std::string result;
-
-        IShellItem* folder;
-
-        // Load library at runtime so app doesn't link it at load time (which will fail on windows XP)
-        dll shell32("shell32.dll");
-        dll::proc<HRESULT WINAPI(PCWSTR, IBindCtx*, REFIID, void**)>
-            create_item(shell32, "SHCreateItemFromParsingName");
-
-        if (!create_item)
-            return "";
-
-        auto hr = create_item(m_wdefault_path.c_str(),
-            nullptr,
-            IID_PPV_ARGS(&folder));
-
-        // Set default folder if found. This only sets the default folder. If
-        // Windows has any info about the most recently selected folder, it
-        // will display it instead. Generally, calling SetFolder() to set the
-        // current directory “is not a good or expected user experience and
-        // should therefore be avoided”:
-        // https://docs.microsoft.com/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifiledialog-setfolder
-        if (SUCCEEDED(hr))
+        const std::unique_ptr<IFileDialog, internal::com_release<IFileDialog>> dialog(ifd);
+        if (!dialog)
         {
-            if (force_path)
-                ifd->SetFolder(folder);
-            else
-                ifd->SetDefaultFolder(folder);
-            folder->Release();
+            internal::dialog_failure("CoCreateInstance.result", ERROR_INVALID_DATA);
         }
 
-        // Set the dialog title and option to select folders
-        ifd->SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-        ifd->SetTitle(m_wtitle.c_str());
-
-        hr = ifd->Show(GetActiveWindow());
-        if (SUCCEEDED(hr))
+        if (!m_wdefault_path.empty())
         {
-            IShellItem* item;
-            hr = ifd->GetResult(&item);
-            if (SUCCEEDED(hr))
+            dll                                                          shell32("shell32.dll");
+            dll::proc<HRESULT WINAPI(PCWSTR, IBindCtx*, REFIID, void**)> create_item(shell32,
+                                                                                     "SHCreateItemFromParsingName");
+            if (!create_item)
             {
-                wchar_t* wname = nullptr;
-                // This is unlikely to fail because we use FOS_FORCEFILESYSTEM, but try
-                // to output a debug message just in case.
-                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &wname)))
-                {
-                    result = internal::wstr2str(std::wstring(wname));
-                    dll::proc<void WINAPI(LPVOID)>(ole32_dll(), "CoTaskMemFree")(wname);
-                }
-                else
-                {
-                    if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &wname)))
-                    {
-                        auto name = internal::wstr2str(std::wstring(wname));
-                        dll::proc<void WINAPI(LPVOID)>(ole32_dll(), "CoTaskMemFree")(wname);
-                        std::cerr << "pfd: failed to get path for " << name << std::endl;
-                    }
-                    else
-                        std::cerr << "pfd: item of unknown type selected" << std::endl;
-                }
-
-                item->Release();
+                internal::dialog_failure("SHCreateItemFromParsingName.unavailable", ERROR_PROC_NOT_FOUND);
             }
+            IShellItem*   folder_output = nullptr;
+            const HRESULT created       = create_item(m_wdefault_path.c_str(), nullptr, IID_PPV_ARGS(&folder_output));
+            const std::unique_ptr<IShellItem, internal::com_release<IShellItem>> folder(folder_output);
+            internal::require_hresult(created, "SHCreateItemFromParsingName");
+            if (!folder)
+            {
+                internal::dialog_failure("SHCreateItemFromParsingName.result", ERROR_INVALID_DATA);
+            }
+            internal::require_hresult(
+                force_path ? dialog->SetFolder(folder.get()) : dialog->SetDefaultFolder(folder.get()),
+                "IFileDialog.SetDefaultFolder");
         }
 
-        ifd->Release();
+        FILEOPENDIALOGOPTIONS options = 0;
+        internal::require_hresult(dialog->GetOptions(&options), "IFileDialog.GetOptions");
+        internal::require_hresult(dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM),
+                                  "IFileDialog.SetOptions");
+        internal::require_hresult(dialog->SetTitle(m_wtitle.c_str()), "IFileDialog.SetTitle");
+        const HRESULT shown = dialog->Show(GetActiveWindow());
+        if (shown == HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        {
+            return "";
+        }
+        internal::require_hresult(shown, "IFileDialog.Show");
 
-        return result;
+        IShellItem*                                                          item_output = nullptr;
+        const HRESULT                                                        result = dialog->GetResult(&item_output);
+        const std::unique_ptr<IShellItem, internal::com_release<IShellItem>> item(item_output);
+        internal::require_hresult(result, "IFileDialog.GetResult");
+        if (!item)
+        {
+            internal::dialog_failure("IFileDialog.GetResult.output", ERROR_INVALID_DATA);
+        }
+
+        wchar_t*      name_output = nullptr;
+        const HRESULT named       = item->GetDisplayName(SIGDN_FILESYSPATH, &name_output);
+        const std::unique_ptr<wchar_t, internal::shell_free> name(name_output);
+        internal::require_hresult(named, "IShellItem.GetDisplayName");
+        if (!name)
+        {
+            internal::dialog_failure("IShellItem.GetDisplayName.output", ERROR_INVALID_DATA);
+        }
+        return internal::wstr2str(name.get());
     }
+
 #endif
 #endif
 
